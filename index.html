@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Jellyfin WebCodecs Player</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/mp4box/0.5.2/mp4box.all.min.js"></script>
+    <title>Jellyfin JSMpeg Player</title>
+    <script src="https://cdn.jsdelivr.net/npm/jsmpeg@0.2.0/jsmpeg.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -72,6 +72,7 @@
             cursor: pointer;
             font-size: 1em;
             transition: background 0.2s;
+            margin-right: 10px;
         }
 
         button:hover {
@@ -181,24 +182,13 @@
             color: #ffd43b;
         }
 
-        .browser-check {
-            background: #3a1a1a;
+        .info-box {
+            background: #1a2a3a;
             padding: 15px;
             border-radius: 6px;
             margin-bottom: 20px;
-            color: #ff6b6b;
-        }
-
-        .stats {
-            display: flex;
-            gap: 15px;
-            font-size: 0.85em;
-        }
-
-        .stat-item {
-            background: #2a2a2a;
-            padding: 8px 12px;
-            border-radius: 4px;
+            color: #66b3ff;
+            border-left: 4px solid #0066cc;
         }
 
         .loading-spinner {
@@ -214,23 +204,41 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        .volume-control {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .volume-control input[type="range"] {
+            width: 100px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎬 Jellyfin WebCodecs Player</h1>
+        <h1>🎬 Jellyfin JSMpeg Player</h1>
 
-        <div id="browser-check"></div>
+        <div class="info-box">
+            <strong>✨ Works everywhere!</strong> Tesla browser, Safari (iPhone/Mac), Chrome, Edge, and more.
+            <br>Note: Requires transcoding server to be running.
+        </div>
 
         <div class="config-panel">
             <div class="form-group">
                 <label for="jellyfin-url">Jellyfin Server URL</label>
-                <input type="text" id="jellyfin-url" placeholder="https://jellyfin.example.com" value="https://demo.jellyfin.org/stable">
+                <input type="text" id="jellyfin-url" placeholder="https://your-jellyfin-tunnel.trycloudflare.com" value="https://reed-template-excluding-antivirus.trycloudflare.com">
             </div>
 
             <div class="form-group">
-                <label for="api-key">API Key (or leave empty for demo server)</label>
+                <label for="api-key">Jellyfin API Key</label>
                 <input type="password" id="api-key" placeholder="Your Jellyfin API key">
+            </div>
+
+            <div class="form-group">
+                <label for="ws-server">WebSocket Server (Your Transcoding Server)</label>
+                <input type="text" id="ws-server" placeholder="ws://your-server.com:8081 or wss://your-server.com">
             </div>
 
             <button onclick="loadLibrary()" id="load-btn">Load Library</button>
@@ -249,51 +257,23 @@
             
             <div class="controls">
                 <div id="player-status" class="status">Ready</div>
-                <div class="stats">
-                    <div class="stat-item">Frames: <span id="frame-count">0</span></div>
-                    <div class="stat-item">Buffer: <span id="buffer-size">0</span> KB</div>
-                    <div class="stat-item">Decoder: <span id="decoder-state">idle</span></div>
+                <div class="volume-control">
+                    <span>🔊</span>
+                    <input type="range" id="volume" min="0" max="100" value="80" oninput="setVolume(this.value)">
+                    <span id="volume-display">80%</span>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        let videoDecoder = null;
-        let audioContext = null;
-        let canvas = null;
-        let ctx = null;
-        let mp4boxFile = null;
-        let frameCount = 0;
-        let videoTrackId = null;
-        let audioTrackId = null;
-        let isPlaying = false;
-
-        // Check browser support
-        function checkBrowserSupport() {
-            const checkDiv = document.getElementById('browser-check');
-            const missing = [];
-            
-            if (!window.VideoDecoder) missing.push('VideoDecoder');
-            if (!window.AudioDecoder) missing.push('AudioDecoder');
-            if (!window.MP4Box) missing.push('MP4Box');
-            
-            if (missing.length > 0) {
-                checkDiv.innerHTML = `
-                    <strong>⚠️ Missing required APIs: ${missing.join(', ')}</strong><br>
-                    Please use Chrome 94+, Edge 94+, or Opera 80+
-                `;
-                document.getElementById('load-btn').disabled = true;
-                return false;
-            }
-            return true;
-        }
-
-        checkBrowserSupport();
+        let currentPlayer = null;
+        let jellyfinConfig = {};
 
         async function loadLibrary() {
             const jellyfinUrl = document.getElementById('jellyfin-url').value.trim();
             const apiKey = document.getElementById('api-key').value.trim();
+            const wsServer = document.getElementById('ws-server').value.trim();
             const statusDiv = document.getElementById('config-status');
             
             statusDiv.style.display = 'block';
@@ -305,6 +285,14 @@
                 statusDiv.textContent = 'Please enter Jellyfin server URL';
                 return;
             }
+
+            if (!wsServer) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = 'Please enter WebSocket server URL';
+                return;
+            }
+
+            jellyfinConfig = { jellyfinUrl, apiKey, wsServer };
 
             try {
                 const url = apiKey 
@@ -323,7 +311,7 @@
                     throw new Error('No items found in library');
                 }
 
-                displayLibrary(data.Items, jellyfinUrl, apiKey);
+                displayLibrary(data.Items);
                 statusDiv.className = 'status success';
                 statusDiv.textContent = `✓ Loaded ${data.Items.length} items`;
             } catch (err) {
@@ -333,19 +321,19 @@
             }
         }
 
-        function displayLibrary(items, jellyfinUrl, apiKey) {
+        function displayLibrary(items) {
             const libraryDiv = document.getElementById('library');
             libraryDiv.innerHTML = '';
 
             items.forEach(item => {
                 const div = document.createElement('div');
                 div.className = 'library-item';
-                div.onclick = () => playItem(item, jellyfinUrl, apiKey);
+                div.onclick = () => playItem(item);
 
                 const img = document.createElement('img');
-                const imgUrl = apiKey
-                    ? `${jellyfinUrl}/Items/${item.Id}/Images/Primary?api_key=${apiKey}`
-                    : `${jellyfinUrl}/Items/${item.Id}/Images/Primary`;
+                const imgUrl = jellyfinConfig.apiKey
+                    ? `${jellyfinConfig.jellyfinUrl}/Items/${item.Id}/Images/Primary?api_key=${jellyfinConfig.apiKey}`
+                    : `${jellyfinConfig.jellyfinUrl}/Items/${item.Id}/Images/Primary`;
                 img.src = imgUrl;
                 img.alt = item.Name;
                 img.onerror = () => {
@@ -362,42 +350,43 @@
             });
         }
 
-        async function playItem(item, jellyfinUrl, apiKey) {
+        function playItem(item) {
             stopPlayback();
-            isPlaying = true;
-            frameCount = 0;
 
             document.getElementById('now-playing').textContent = item.Name;
             document.getElementById('player-container').classList.add('active');
             
             const statusDiv = document.getElementById('player-status');
             statusDiv.className = 'status';
-            statusDiv.innerHTML = '<span class="loading-spinner"></span> Initializing player...';
+            statusDiv.innerHTML = '<span class="loading-spinner"></span> Connecting to stream...';
 
-            canvas = document.getElementById('video-canvas');
-            ctx = canvas.getContext('2d');
-
-            // Build stream URL
-            const params = new URLSearchParams({
-                Static: 'false',
-                VideoCodec: 'h264',
-                AudioCodec: 'aac',
-                Container: 'mp4',
-                TranscodingContainer: 'mp4',
-                TranscodingProtocol: 'http'
-            });
-
-            if (apiKey) {
-                params.append('api_key', apiKey);
-            }
-
-            const streamUrl = `${jellyfinUrl}/Videos/${item.Id}/stream.mp4?${params}`;
+            // Build WebSocket URL with item ID
+            const wsUrl = `${jellyfinConfig.wsServer}/stream/${item.Id}`;
             
-            console.log('Stream URL:', streamUrl);
-            statusDiv.textContent = 'Fetching video stream...';
+            console.log('Connecting to:', wsUrl);
 
             try {
-                await setupMP4Stream(streamUrl);
+                currentPlayer = new JSMpeg.Player(wsUrl, {
+                    canvas: document.getElementById('video-canvas'),
+                    autoplay: true,
+                    audio: true,
+                    videoBufferSize: 1024 * 1024,
+                    audioBufferSize: 256 * 1024,
+                    onSourceEstablished: () => {
+                        statusDiv.className = 'status success';
+                        statusDiv.textContent = '▶ Playing';
+                    },
+                    onSourceCompleted: () => {
+                        statusDiv.className = 'status';
+                        statusDiv.textContent = '✓ Playback complete';
+                    }
+                });
+
+                // Set initial volume
+                const volume = document.getElementById('volume').value / 100;
+                if (currentPlayer.audioOut) {
+                    currentPlayer.audioOut.volume = volume;
+                }
             } catch (err) {
                 statusDiv.className = 'status error';
                 statusDiv.textContent = `Playback error: ${err.message}`;
@@ -405,152 +394,19 @@
             }
         }
 
-        async function setupMP4Stream(streamUrl) {
-            const statusDiv = document.getElementById('player-status');
-            
-            // Create MP4Box file
-            mp4boxFile = MP4Box.createFile();
-            let offset = 0;
-
-            mp4boxFile.onError = (e) => {
-                console.error('MP4Box error:', e);
-                statusDiv.className = 'status error';
-                statusDiv.textContent = `MP4 parsing error: ${e}`;
-            };
-
-            mp4boxFile.onReady = (info) => {
-                console.log('MP4 Ready:', info);
-                statusDiv.className = 'status success';
-                statusDiv.textContent = 'Video loaded, starting playback...';
-
-                // Setup video track
-                if (info.videoTracks && info.videoTracks.length > 0) {
-                    const videoTrack = info.videoTracks[0];
-                    videoTrackId = videoTrack.id;
-                    
-                    console.log('Video track:', videoTrack);
-
-                    // Configure video decoder
-                    videoDecoder = new VideoDecoder({
-                        output: (frame) => {
-                            if (!isPlaying) {
-                                frame.close();
-                                return;
-                            }
-
-                            canvas.width = frame.displayWidth;
-                            canvas.height = frame.displayHeight;
-                            ctx.drawImage(frame, 0, 0);
-                            frame.close();
-
-                            frameCount++;
-                            document.getElementById('frame-count').textContent = frameCount;
-                            document.getElementById('decoder-state').textContent = 'decoding';
-                        },
-                        error: (e) => {
-                            console.error('Video decoder error:', e);
-                            statusDiv.className = 'status error';
-                            statusDiv.textContent = `Decoder error: ${e.message}`;
-                        }
-                    });
-
-                    videoDecoder.configure({
-                        codec: videoTrack.codec.startsWith('avc1') ? videoTrack.codec : 'avc1.64001f',
-                        codedWidth: videoTrack.track_width,
-                        codedHeight: videoTrack.track_height,
-                        optimizeForLatency: true
-                    });
-
-                    mp4boxFile.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
-                }
-
-                // Setup audio track
-                if (info.audioTracks && info.audioTracks.length > 0) {
-                    const audioTrack = info.audioTracks[0];
-                    audioTrackId = audioTrack.id;
-                    console.log('Audio track:', audioTrack);
-                    // Audio decoding would go here
-                }
-
-                mp4boxFile.start();
-                statusDiv.className = 'status success';
-                statusDiv.textContent = '▶ Playing';
-            };
-
-            mp4boxFile.onSamples = (id, user, samples) => {
-                if (id !== videoTrackId || !videoDecoder) return;
-
-                for (const sample of samples) {
-                    try {
-                        const chunk = new EncodedVideoChunk({
-                            type: sample.is_sync ? 'key' : 'delta',
-                            timestamp: (sample.cts * 1000000) / sample.timescale,
-                            duration: (sample.duration * 1000000) / sample.timescale,
-                            data: sample.data
-                        });
-                        
-                        videoDecoder.decode(chunk);
-                        
-                        const bufferKB = Math.round(sample.data.byteLength / 1024);
-                        document.getElementById('buffer-size').textContent = bufferKB;
-                    } catch (e) {
-                        console.error('Decode error:', e);
-                    }
-                }
-            };
-
-            // Fetch and stream data
-            statusDiv.textContent = 'Downloading video...';
-            const response = await fetch(streamUrl);
-            
-            if (!response.ok) {
-                throw new Error(`Failed to fetch stream: ${response.status}`);
+        function stopPlayback() {
+            if (currentPlayer) {
+                currentPlayer.destroy();
+                currentPlayer = null;
             }
-
-            const reader = response.body.getReader();
-            
-            while (isPlaying) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                const arrayBuffer = value.buffer;
-                arrayBuffer.fileStart = offset;
-                
-                mp4boxFile.appendBuffer(arrayBuffer);
-                offset += arrayBuffer.byteLength;
-            }
-
-            mp4boxFile.flush();
+            document.getElementById('player-container').classList.remove('active');
         }
 
-        function stopPlayback() {
-            isPlaying = false;
-
-            if (videoDecoder) {
-                try {
-                    videoDecoder.close();
-                } catch (e) {
-                    console.error('Error closing decoder:', e);
-                }
-                videoDecoder = null;
+        function setVolume(value) {
+            document.getElementById('volume-display').textContent = value + '%';
+            if (currentPlayer && currentPlayer.audioOut) {
+                currentPlayer.audioOut.volume = value / 100;
             }
-
-            if (mp4boxFile) {
-                try {
-                    mp4boxFile.flush();
-                } catch (e) {}
-                mp4boxFile = null;
-            }
-
-            if (canvas && ctx) {
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-            }
-
-            frameCount = 0;
-            document.getElementById('frame-count').textContent = '0';
-            document.getElementById('buffer-size').textContent = '0';
-            document.getElementById('decoder-state').textContent = 'idle';
-            document.getElementById('player-container').classList.remove('active');
         }
     </script>
 </body>
